@@ -211,23 +211,6 @@ async function processMessage(phone, userMessage) {
   }
 }
 
-// Procura recursivamente um JID de numero real (@s.whatsapp.net) em qualquer
-// parte do payload. Usado quando o remetente vem como @lid (privacidade).
-function findRealJid(obj) {
-  let result = null;
-  (function walk(o) {
-    if (result) return;
-    if (typeof o === 'string') {
-      if (o.endsWith('@s.whatsapp.net')) result = o;
-    } else if (Array.isArray(o)) {
-      for (const v of o) { walk(v); if (result) return; }
-    } else if (o && typeof o === 'object') {
-      for (const k of Object.keys(o)) { walk(o[k]); if (result) return; }
-    }
-  })(obj);
-  return result;
-}
-
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -237,15 +220,17 @@ app.post('/webhook', async (req, res) => {
     const jid = key.remoteJid;
     if (jid.includes('@g.us') || key.fromMe) return;
 
-    // WhatsApp pode identificar o remetente com @lid (privacidade) em vez do numero.
-    // O @lid nao serve para responder; precisamos achar o numero real (@s.whatsapp.net)
-    // em qualquer lugar do payload bruto do webhook.
+    // Remetente com privacidade @lid: a Evolution 2.2.3 nao expoe o numero real
+    // (so vem o @lid, que a validacao de envio rejeita). Em versoes mais novas da
+    // Evolution o numero viria em senderPn/remoteJidAlt. Sem ele, nao da para
+    // responder corretamente - melhor nao responder do que mandar para o numero errado.
     let replyTo = jid;
     if (jid.includes('@lid')) {
-      console.log('LID DEBUG FULL:', JSON.stringify(body.data));
-      const real = findRealJid(body);
-      replyTo = real || key.senderPn || key.remoteJidAlt || key.participant || jid;
-      console.log('LID -> replyTo resolvido:', replyTo);
+      replyTo = key.senderPn || key.remoteJidAlt || null;
+      if (!replyTo) {
+        console.log('Remetente @lid sem numero real (limitacao Evolution 2.2.3):', jid, '-', body.data.pushName);
+        return;
+      }
     }
 
     // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
