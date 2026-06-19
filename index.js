@@ -216,9 +216,20 @@ app.post('/webhook', async (req, res) => {
   try {
     const body = req.body;
     if (!body?.data?.key?.remoteJid) return;
-    const jid = body.data.key.remoteJid;
-    if (jid.includes('@g.us') || body.data.key.fromMe) return;
-    const phone = jid.replace('@s.whatsapp.net', '');
+    const key = body.data.key;
+    const jid = key.remoteJid;
+    if (jid.includes('@g.us') || key.fromMe) return;
+
+    // WhatsApp pode identificar o remetente com @lid (privacidade) em vez do numero.
+    // O @lid nao serve para responder; precisamos do numero real (senderPn etc).
+    let replyTo = jid;
+    if (jid.includes('@lid')) {
+      console.log('LID DEBUG key:', JSON.stringify(key));
+      replyTo = key.senderPn || key.remoteJidAlt || key.participant || jid;
+    }
+
+    // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
+    const phone = jid.replace('@s.whatsapp.net', '').replace('@lid', '');
 
     const messageData = body.data.message;
     let text =
@@ -229,7 +240,7 @@ app.post('/webhook', async (req, res) => {
     if (!text && messageData?.imageMessage) {
       const caption = messageData.imageMessage.caption || '';
       if (!(await withinMediaLimit(phone))) {
-        await sendWhatsApp(jid, 'Vi que você mandou várias fotos seguidas! Pra eu analisar com calma, manda uma de cada vez, com um intervalo curtinho entre elas 😊');
+        await sendWhatsApp(replyTo, 'Vi que você mandou várias fotos seguidas! Pra eu analisar com calma, manda uma de cada vez, com um intervalo curtinho entre elas 😊');
         return;
       }
       const media = await getMediaBase64(body.data.key);
@@ -245,7 +256,7 @@ app.post('/webhook', async (req, res) => {
 
     if (!text && (messageData?.audioMessage || messageData?.pttMessage)) {
       if (!(await withinMediaLimit(phone))) {
-        await sendWhatsApp(jid, 'Vi que você mandou vários áudios seguidos! Pra eu ouvir com calma, manda um de cada vez, com um intervalo curtinho entre eles 😊');
+        await sendWhatsApp(replyTo, 'Vi que você mandou vários áudios seguidos! Pra eu ouvir com calma, manda um de cada vez, com um intervalo curtinho entre eles 😊');
         return;
       }
       const media = await getMediaBase64(body.data.key);
@@ -265,7 +276,7 @@ app.post('/webhook', async (req, res) => {
 
     const reply = await processMessage(phone, text);
     console.log(`[Kognix → ${phone}]: ${reply}`);
-    await sendWhatsApp(jid, reply);
+    await sendWhatsApp(replyTo, reply);
   } catch (err) {
     console.error('Erro no webhook:', err.message);
   }
