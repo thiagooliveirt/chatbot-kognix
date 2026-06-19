@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios = require('axios');
 const Redis = require('ioredis');
 
@@ -8,6 +9,8 @@ const app = express();
 app.use(express.json());
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = gemini.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
 const EVOLUTION_URL      = process.env.EVOLUTION_API_URL;
 const EVOLUTION_KEY      = process.env.EVOLUTION_API_KEY;
@@ -30,6 +33,16 @@ async function saveHistory(phone, history) {
   await redis.set(`conv:${phone}`, JSON.stringify(history), 'EX', TTL);
 }
 
+const MEDIA_LIMIT  = 8;        // max fotos/audios processados pelo Gemini
+const MEDIA_WINDOW = 60 * 30;  // por numero, em 30 minutos
+
+async function withinMediaLimit(phone) {
+  const key = `media:${phone}`;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, MEDIA_WINDOW);
+  return count <= MEDIA_LIMIT;
+}
+
 async function getLeadState(phone) {
   const data = await redis.get(`lead:${phone}`);
   return data ? JSON.parse(data) : { saved: false, notified: false };
@@ -49,6 +62,11 @@ FORMATO DAS RESPOSTAS:
 - NUNCA use asteriscos, underlines, markdown ou qualquer formatação especial
 - Escreva em texto puro, como uma pessoa digitando no WhatsApp
 - Use emojis com moderação
+
+MENSAGENS MULTIMODAIS:
+- Mensagens que chegam como "[Imagem recebida] ..." ou "[Áudio transcrito] ..." são fotos e áudios que o cliente mandou, já descritos/transcritos pra você.
+- Trate o conteúdo depois dos colchetes como se o cliente tivesse te mostrado ou contado aquilo diretamente. NUNCA repita os colchetes ou mencione "imagem recebida"/"áudio transcrito" pro cliente.
+- Use a informação (foto de carro, conta de luz, documento, áudio) pra avançar o atendimento (ex: orçamento, qualificação), igual faria lendo ou ouvindo de verdade.
 
 COMO SE COMPORTAR:
 - Tom direto, consultivo e confiante
@@ -77,6 +95,46 @@ REGRAS:
 - Sempre conduza para o teste gratuito como próximo passo
 
 Contato: WhatsApp (21) 99999-9999 | kognixsolutions.com.br`;
+
+async function getMediaBase64(messageKey) {
+  try {
+    const response = await axios.post(
+      `${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${EVOLUTION_INSTANCE}`,
+      { message: { key: messageKey } },
+      { headers: { apikey: EVOLUTION_KEY } }
+    );
+    return response.data;
+  } catch (err) {
+    console.error('[Erro ao baixar midia]', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function describeImage(base64, mimetype) {
+  try {
+    const result = await geminiModel.generateContent([
+      { inlineData: { data: base64, mimeType: mimetype || 'image/jpeg' } },
+      'Descreva objetivamente o que aparece nessa imagem, focando em qualquer informação útil para um agente de vendas: tipo de objeto/veículo/imóvel, estado de conservação, texto visível, valores, datas, dados de conta ou documento. Responda em português, em no máximo 3 frases.',
+    ]);
+    return result.response.text();
+  } catch (err) {
+    console.error('[Erro Gemini Vision]', err.message);
+    return null;
+  }
+}
+
+async function transcribeAudio(base64, mimetype) {
+  try {
+    const result = await geminiModel.generateContent([
+      { inlineData: { data: base64, mimeType: mimetype || 'audio/ogg' } },
+      'Transcreva fielmente o áudio a seguir em português. Responda APENAS com a transcrição, sem comentários nem aspas.',
+    ]);
+    return result.response.text();
+  } catch (err) {
+    console.error('[Erro Gemini audio]', err.message);
+    return null;
+  }
+}
 
 async function sendWhatsApp(jid, message) {
   try {
@@ -160,21 +218,49 @@ app.post('/webhook', async (req, res) => {
     if (!body?.data?.key?.remoteJid) return;
     const jid = body.data.key.remoteJid;
     if (jid.includes('@g.us') || body.data.key.fromMe) return;
+    const phone = jid.replace('@s.whatsapp.net', '');
 
     const messageData = body.data.message;
-    const text =
+    let text =
       messageData?.conversation ||
       messageData?.extendedTextMessage?.text ||
-      messageData?.imageMessage?.caption || null;
+      null;
 
-    if (!text) {
-      if (messageData?.audioMessage || messageData?.pttMessage) {
-        await sendWhatsApp(jid, 'Oi! Não consigo ouvir áudios, mas pode me escrever que te atendo na hora 😊');
+    if (!text && messageData?.imageMessage) {
+      const caption = messageData.imageMessage.caption || '';
+      if (!(await withinMediaLimit(phone))) {
+        await sendWhatsApp(jid, 'Vi que você mandou várias fotos seguidas! Pra eu analisar com calma, manda uma de cada vez, com um intervalo curtinho entre elas 😊');
+        return;
       }
-      return;
+      const media = await getMediaBase64(body.data.key);
+      const description = media?.base64
+        ? await describeImage(media.base64, messageData.imageMessage.mimetype)
+        : null;
+      if (description) {
+        text = `[Imagem recebida${caption ? ` com legenda: "${caption}"` : ''}] ${description}`;
+      } else {
+        text = caption || '[O cliente enviou uma imagem, mas não consegui analisar o conteúdo agora]';
+      }
     }
 
-    const phone = jid.replace('@s.whatsapp.net', '');
+    if (!text && (messageData?.audioMessage || messageData?.pttMessage)) {
+      if (!(await withinMediaLimit(phone))) {
+        await sendWhatsApp(jid, 'Vi que você mandou vários áudios seguidos! Pra eu ouvir com calma, manda um de cada vez, com um intervalo curtinho entre eles 😊');
+        return;
+      }
+      const media = await getMediaBase64(body.data.key);
+      const mimetype = messageData.audioMessage?.mimetype || messageData.pttMessage?.mimetype;
+      const transcript = media?.base64 ? await transcribeAudio(media.base64, mimetype) : null;
+      if (transcript) {
+        text = `[Áudio transcrito] ${transcript}`;
+      } else {
+        await sendWhatsApp(jid, 'Oi! Recebi seu áudio mas não consegui processar agora. Pode escrever a mensagem? 😊');
+        return;
+      }
+    }
+
+    if (!text) return;
+
     console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${phone}: ${text}`);
 
     const reply = await processMessage(phone, text);
