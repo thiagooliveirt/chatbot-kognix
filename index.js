@@ -211,6 +211,23 @@ async function processMessage(phone, userMessage) {
   }
 }
 
+// Procura recursivamente um JID de numero real (@s.whatsapp.net) em qualquer
+// parte do payload. Usado quando o remetente vem como @lid (privacidade).
+function findRealJid(obj) {
+  let result = null;
+  (function walk(o) {
+    if (result) return;
+    if (typeof o === 'string') {
+      if (o.endsWith('@s.whatsapp.net')) result = o;
+    } else if (Array.isArray(o)) {
+      for (const v of o) { walk(v); if (result) return; }
+    } else if (o && typeof o === 'object') {
+      for (const k of Object.keys(o)) { walk(o[k]); if (result) return; }
+    }
+  })(obj);
+  return result;
+}
+
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
@@ -221,11 +238,14 @@ app.post('/webhook', async (req, res) => {
     if (jid.includes('@g.us') || key.fromMe) return;
 
     // WhatsApp pode identificar o remetente com @lid (privacidade) em vez do numero.
-    // O @lid nao serve para responder; precisamos do numero real (senderPn etc).
+    // O @lid nao serve para responder; precisamos achar o numero real (@s.whatsapp.net)
+    // em qualquer lugar do payload bruto do webhook.
     let replyTo = jid;
     if (jid.includes('@lid')) {
-      console.log('LID DEBUG key:', JSON.stringify(key));
-      replyTo = key.senderPn || key.remoteJidAlt || key.participant || jid;
+      console.log('LID DEBUG FULL:', JSON.stringify(body.data));
+      const real = findRealJid(body);
+      replyTo = real || key.senderPn || key.remoteJidAlt || key.participant || jid;
+      console.log('LID -> replyTo resolvido:', replyTo);
     }
 
     // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
