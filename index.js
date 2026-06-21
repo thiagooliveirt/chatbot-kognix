@@ -24,6 +24,13 @@ const geminiModel = gemini.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
 const NOTIFY_NUMBERS = ['5521974056251']; // Thiago
 
+// Token que protege as rotas administrativas (/qr e /reset).
+// Defina ADMIN_TOKEN no Railway e no .env. Sem ele, essas rotas ficam bloqueadas.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+function isAuthorized(req) {
+  return Boolean(ADMIN_TOKEN) && req.query.token === ADMIN_TOKEN;
+}
+
 const redis = new Redis(process.env.REDIS_URL);
 redis.on('connect', () => console.log('Redis conectado ✓'));
 redis.on('error',   (err) => console.error('Erro Redis:', err.message));
@@ -96,6 +103,16 @@ async function withinMediaLimit(phone) {
   const count = await redis.incr(key);
   if (count === 1) await redis.expire(key, MEDIA_WINDOW);
   return count <= MEDIA_LIMIT;
+}
+
+const TEXT_LIMIT  = 40;        // max mensagens de texto processadas pela IA
+const TEXT_WINDOW = 60 * 15;   // por numero, em 15 minutos (anti-flood / anti-custo)
+
+async function textMsgCount(phone) {
+  const key = `txt:${phone}`;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, TEXT_WINDOW);
+  return count;
 }
 
 async function getLeadState(phone) {
@@ -311,6 +328,16 @@ async function handleMessage(msg) {
 
     if (!text) return;
 
+    // Rate-limit de texto: protege contra flood e estouro de custo de API.
+    const txtCount = await textMsgCount(phone);
+    if (txtCount > TEXT_LIMIT) {
+      if (txtCount === TEXT_LIMIT + 1) {
+        await sendWhatsApp(jid, 'Recebi muitas mensagens em sequência! Vou retomar nosso papo daqui a pouco. Se for urgente, fala com a gente em kognixsolutions.com.br 😊');
+      }
+      console.warn(`[rate-limit] ${phone}: ${txtCount} msgs em ${TEXT_WINDOW / 60}min — ignorando`);
+      return;
+    }
+
     console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${phone} (${msg.pushName}): ${text}`);
 
     await sock.sendPresenceUpdate('composing', jid);
@@ -371,6 +398,14 @@ async function startSock() {
 // ── Servidor HTTP: QR + health ─────────────────────────────────
 const app = express();
 
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 app.get('/', (req, res) => res.json({
   status: 'Kognix Bot online ✓',
   whatsapp: connectionStatus,
@@ -378,6 +413,10 @@ app.get('/', (req, res) => res.json({
 }));
 
 app.get('/qr', async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).send(page('Acesso negado',
+      '<p>Token invalido ou ausente. Acesse com ?token=SEU_ADMIN_TOKEN</p>'));
+  }
   if (connectionStatus === 'conectado') {
     return res.send(page('WhatsApp conectado ✓', '<p style="color:#10b981;font-size:20px">Robô conectado e operando.</p>'));
   }
@@ -392,13 +431,18 @@ app.get('/qr', async (req, res) => {
 });
 
 app.get('/reset', async (req, res) => {
+  if (!isAuthorized(req)) {
+    return res.status(401).send(page('Acesso negado',
+      '<p>Token invalido ou ausente. Acesse com ?token=SEU_ADMIN_TOKEN</p>'));
+  }
   try {
     const { clearAll } = await useRedisAuthState();
     await clearAll();
     res.send(page('Credenciais limpas', '<p>Reiniciando para gerar novo QR. Aguarde e acesse /qr.</p>'));
     setTimeout(() => process.exit(0), 1500); // Railway reinicia o processo
   } catch (err) {
-    res.status(500).send('Erro: ' + err.message);
+    console.error('[reset] erro:', err.message);
+    res.status(500).send(page('Erro', '<p>Nao foi possivel resetar agora.</p>'));
   }
 });
 
