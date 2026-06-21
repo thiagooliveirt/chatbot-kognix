@@ -220,15 +220,16 @@ app.post('/webhook', async (req, res) => {
     const jid = key.remoteJid;
     if (jid.includes('@g.us') || key.fromMe) return;
 
-    // @lid: identificador opaco do WhatsApp para contas com privacidade avancada.
-    // Tentamos campos alternativos; se nao vierem, tentamos enviar direto ao @lid
-    // (Evolution latest roteia via Baileys internamente).
+    // @lid: dump completo para encontrar o numero real no payload
+    if (jid.includes('@lid')) {
+      console.log('[lid] PAYLOAD COMPLETO:', JSON.stringify(body, null, 2));
+    }
+
     let replyTo = jid;
     if (jid.includes('@lid')) {
       replyTo = key.senderPn
         ? `${key.senderPn}@s.whatsapp.net`
         : (key.remoteJidAlt || jid);
-      console.log('[lid] replyTo:', replyTo, '| pushName:', body.data.pushName);
     }
 
     // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
