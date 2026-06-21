@@ -2,20 +2,27 @@ require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const axios = require('axios');
 const Redis = require('ioredis');
+const pino = require('pino');
+const QRCode = require('qrcode');
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  downloadMediaMessage,
+  initAuthCreds,
+  BufferJSON,
+  proto,
+  Browsers,
+} = require('@whiskeysockets/baileys');
 
-const app = express();
-app.use(express.json());
+const logger = pino({ level: 'silent' });
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const geminiModel = gemini.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-const EVOLUTION_URL      = process.env.EVOLUTION_API_URL;
-const EVOLUTION_KEY      = process.env.EVOLUTION_API_KEY;
-const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE;
-const NOTIFY_NUMBERS     = ['5521974056251']; // Thiago
+const NOTIFY_NUMBERS = ['5521974056251']; // Thiago
 
 const redis = new Redis(process.env.REDIS_URL);
 redis.on('connect', () => console.log('Redis conectado ✓'));
@@ -23,6 +30,54 @@ redis.on('error',   (err) => console.error('Erro Redis:', err.message));
 
 const TTL         = 60 * 60 * 24 * 7;
 const MAX_HISTORY = 20;
+
+// ── Auth state persistido no Redis (Railway tem disco efemero) ──────
+async function useRedisAuthState(prefix = 'wa:kognix') {
+  const writeData = (key, data) =>
+    redis.set(`${prefix}:${key}`, JSON.stringify(data, BufferJSON.replacer));
+  const readData = async (key) => {
+    const data = await redis.get(`${prefix}:${key}`);
+    return data ? JSON.parse(data, BufferJSON.reviver) : null;
+  };
+  const removeData = (key) => redis.del(`${prefix}:${key}`);
+
+  const creds = (await readData('creds')) || initAuthCreds();
+
+  return {
+    clearAll: async () => {
+      const keys = await redis.keys(`${prefix}:*`);
+      if (keys.length) await redis.del(...keys);
+    },
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(ids.map(async (id) => {
+            let value = await readData(`${type}-${id}`);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }));
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const category in data) {
+            for (const id in data[category]) {
+              const value = data[category][id];
+              const key = `${category}-${id}`;
+              tasks.push(value ? writeData(key, value) : removeData(key));
+            }
+          }
+          await Promise.all(tasks);
+        },
+      },
+    },
+    saveCreds: () => writeData('creds', creds),
+  };
+}
 
 async function getHistory(phone) {
   const data = await redis.get(`conv:${phone}`);
@@ -84,31 +139,12 @@ AGENTES DISPONÍVEIS:
 - Qualificador: imóveis e veículos — separa curioso de comprador, entrega lead quente
 - Orçamentista: engenharia e solar — lê foto/PDF e monta orçamento sozinho
 
-PLANOS:
-- Starter: R$ 300/mês + setup R$ 400
-- Business: R$ 550/mês + setup R$ 800
-- Enterprise: R$ 900/mês + setup R$ 1.200
-
 REGRAS:
 - NÃO feche contratos ou aceite pagamentos
 - NÃO ofereça descontos
 - Sempre conduza para o teste gratuito como próximo passo
 
-Contato: WhatsApp (21) 99999-9999 | kognixsolutions.com.br`;
-
-async function getMediaBase64(messageKey) {
-  try {
-    const response = await axios.post(
-      `${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${EVOLUTION_INSTANCE}`,
-      { message: { key: messageKey } },
-      { headers: { apikey: EVOLUTION_KEY } }
-    );
-    return response.data;
-  } catch (err) {
-    console.error('[Erro ao baixar midia]', err.response?.data || err.message);
-    return null;
-  }
-}
+Contato: kognixsolutions.com.br`;
 
 async function describeImage(base64, mimetype) {
   try {
@@ -136,15 +172,29 @@ async function transcribeAudio(base64, mimetype) {
   }
 }
 
+// ── WhatsApp via Baileys direto ────────────────────────────────
+let sock = null;
+let lastQR = null;
+let connectionStatus = 'iniciando';
+
+async function downloadMedia(msg) {
+  try {
+    const buffer = await downloadMediaMessage(
+      msg, 'buffer', {},
+      { logger, reuploadRequest: sock.updateMediaMessage }
+    );
+    return buffer.toString('base64');
+  } catch (err) {
+    console.error('[Erro download midia]', err.message);
+    return null;
+  }
+}
+
 async function sendWhatsApp(jid, message) {
   try {
-    await axios.post(
-      `${EVOLUTION_URL}/message/sendText/${EVOLUTION_INSTANCE}`,
-      { number: jid, text: message },
-      { headers: { apikey: EVOLUTION_KEY } }
-    );
+    await sock.sendMessage(jid, { text: message });
   } catch (err) {
-    console.error('Erro ao enviar mensagem:', err.response?.data || err.message);
+    console.error('Erro ao enviar mensagem:', err.message);
   }
 }
 
@@ -211,45 +261,30 @@ async function processMessage(phone, userMessage) {
   }
 }
 
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+async function handleMessage(msg) {
   try {
-    const body = req.body;
-    if (!body?.data?.key?.remoteJid) return;
-    const key = body.data.key;
-    const jid = key.remoteJid;
-    if (jid.includes('@g.us') || key.fromMe) return;
+    if (!msg.message || msg.key.fromMe) return;
+    const jid = msg.key.remoteJid;
+    if (!jid || jid.includes('@g.us') || jid === 'status@broadcast') return;
 
-    // @lid: dump completo para encontrar o numero real no payload
-    if (jid.includes('@lid')) {
-      console.log('[lid] PAYLOAD COMPLETO:', JSON.stringify(body, null, 2));
-    }
+    // chave estavel para Redis (historico/rate-limit/lead)
+    const phone = jid.replace(/@.*/, '');
 
-    let replyTo = jid;
-    if (jid.includes('@lid')) {
-      replyTo = key.senderPn
-        ? `${key.senderPn}@s.whatsapp.net`
-        : (key.remoteJidAlt || jid);
-    }
-
-    // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
-    const phone = jid.replace('@s.whatsapp.net', '').replace('@lid', '');
-
-    const messageData = body.data.message;
+    const m = msg.message;
     let text =
-      messageData?.conversation ||
-      messageData?.extendedTextMessage?.text ||
+      m.conversation ||
+      m.extendedTextMessage?.text ||
       null;
 
-    if (!text && messageData?.imageMessage) {
-      const caption = messageData.imageMessage.caption || '';
+    if (!text && m.imageMessage) {
+      const caption = m.imageMessage.caption || '';
       if (!(await withinMediaLimit(phone))) {
-        await sendWhatsApp(replyTo, 'Vi que você mandou várias fotos seguidas! Pra eu analisar com calma, manda uma de cada vez, com um intervalo curtinho entre elas 😊');
+        await sendWhatsApp(jid, 'Vi que você mandou várias fotos seguidas! Pra eu analisar com calma, manda uma de cada vez, com um intervalo curtinho entre elas 😊');
         return;
       }
-      const media = await getMediaBase64(body.data.key);
-      const description = media?.base64
-        ? await describeImage(media.base64, messageData.imageMessage.mimetype)
+      const base64 = await downloadMedia(msg);
+      const description = base64
+        ? await describeImage(base64, m.imageMessage.mimetype)
         : null;
       if (description) {
         text = `[Imagem recebida${caption ? ` com legenda: "${caption}"` : ''}] ${description}`;
@@ -258,14 +293,14 @@ app.post('/webhook', async (req, res) => {
       }
     }
 
-    if (!text && (messageData?.audioMessage || messageData?.pttMessage)) {
+    if (!text && (m.audioMessage || m.pttMessage)) {
       if (!(await withinMediaLimit(phone))) {
-        await sendWhatsApp(replyTo, 'Vi que você mandou vários áudios seguidos! Pra eu ouvir com calma, manda um de cada vez, com um intervalo curtinho entre eles 😊');
+        await sendWhatsApp(jid, 'Vi que você mandou vários áudios seguidos! Pra eu ouvir com calma, manda um de cada vez, com um intervalo curtinho entre eles 😊');
         return;
       }
-      const media = await getMediaBase64(body.data.key);
-      const mimetype = messageData.audioMessage?.mimetype || messageData.pttMessage?.mimetype;
-      const transcript = media?.base64 ? await transcribeAudio(media.base64, mimetype) : null;
+      const base64 = await downloadMedia(msg);
+      const mimetype = m.audioMessage?.mimetype || m.pttMessage?.mimetype;
+      const transcript = base64 ? await transcribeAudio(base64, mimetype) : null;
       if (transcript) {
         text = `[Áudio transcrito] ${transcript}`;
       } else {
@@ -276,17 +311,108 @@ app.post('/webhook', async (req, res) => {
 
     if (!text) return;
 
-    console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${phone}: ${text}`);
+    console.log(`[${new Date().toLocaleTimeString('pt-BR')}] ${phone} (${msg.pushName}): ${text}`);
 
+    await sock.sendPresenceUpdate('composing', jid);
     const reply = await processMessage(phone, text);
     console.log(`[Kognix → ${phone}]: ${reply}`);
-    await sendWhatsApp(replyTo, reply);
+    await sendWhatsApp(jid, reply);
   } catch (err) {
-    console.error('Erro no webhook:', err.message);
+    console.error('Erro ao processar mensagem:', err.message);
+  }
+}
+
+async function startSock() {
+  const { state, saveCreds } = await useRedisAuthState();
+  const { version } = await fetchLatestBaileysVersion();
+  console.log('Baileys WA version:', version.join('.'));
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    browser: Browsers.appropriate('Chrome'),
+    markOnlineOnConnect: false,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+    if (qr) {
+      lastQR = qr;
+      connectionStatus = 'aguardando_qr';
+      console.log('>>> QR gerado. Acesse /qr para escanear.');
+    }
+    if (connection === 'open') {
+      lastQR = null;
+      connectionStatus = 'conectado';
+      console.log('WhatsApp conectado ✓');
+    }
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      connectionStatus = 'desconectado';
+      console.log('Conexao fechada. Status:', statusCode, '| loggedOut:', loggedOut);
+      if (!loggedOut) {
+        setTimeout(startSock, 3000);
+      } else {
+        console.log('Deslogado pelo WhatsApp. Acesse /reset para limpar e gerar novo QR.');
+      }
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+    for (const msg of messages) await handleMessage(msg);
+  });
+}
+
+// ── Servidor HTTP: QR + health ─────────────────────────────────
+const app = express();
+
+app.get('/', (req, res) => res.json({
+  status: 'Kognix Bot online ✓',
+  whatsapp: connectionStatus,
+  timestamp: new Date().toISOString(),
+}));
+
+app.get('/qr', async (req, res) => {
+  if (connectionStatus === 'conectado') {
+    return res.send(page('WhatsApp conectado ✓', '<p style="color:#10b981;font-size:20px">Robô conectado e operando.</p>'));
+  }
+  if (!lastQR) {
+    return res.send(page('Aguardando QR...', '<p>Gerando QR code. Atualize em alguns segundos.</p>'));
+  }
+  const dataUrl = await QRCode.toDataURL(lastQR, { width: 320, margin: 2 });
+  res.send(page('Conecte o WhatsApp do robô',
+    `<img src="${dataUrl}" style="border-radius:12px"/>
+     <p style="margin-top:24px">No celular do robô: WhatsApp → Aparelhos conectados → Conectar aparelho</p>
+     <p style="opacity:.5;font-size:13px">A página atualiza sozinha se o QR expirar</p>`));
+});
+
+app.get('/reset', async (req, res) => {
+  try {
+    const { clearAll } = await useRedisAuthState();
+    await clearAll();
+    res.send(page('Credenciais limpas', '<p>Reiniciando para gerar novo QR. Aguarde e acesse /qr.</p>'));
+    setTimeout(() => process.exit(0), 1500); // Railway reinicia o processo
+  } catch (err) {
+    res.status(500).send('Erro: ' + err.message);
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'Kognix Bot online ✓', timestamp: new Date().toISOString() }));
+function page(title, body) {
+  return `<!doctype html><html><head><meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="15">
+  <title>Kognix Bot</title></head>
+  <body style="background:#080c14;color:#fff;font-family:system-ui,sans-serif;text-align:center;padding:48px 20px">
+  <h2 style="color:#00d4ff;margin-bottom:28px">${title}</h2>${body}</body></html>`;
+}
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Kognix Bot rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Kognix Bot rodando na porta ${PORT}`);
+  startSock();
+});
