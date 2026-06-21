@@ -220,17 +220,15 @@ app.post('/webhook', async (req, res) => {
     const jid = key.remoteJid;
     if (jid.includes('@g.us') || key.fromMe) return;
 
-    // Remetente com privacidade @lid: a Evolution 2.2.3 nao expoe o numero real
-    // (so vem o @lid, que a validacao de envio rejeita). Em versoes mais novas da
-    // Evolution o numero viria em senderPn/remoteJidAlt. Sem ele, nao da para
-    // responder corretamente - melhor nao responder do que mandar para o numero errado.
+    // @lid: identificador opaco do WhatsApp para contas com privacidade avancada.
+    // Tentamos campos alternativos; se nao vierem, tentamos enviar direto ao @lid
+    // (Evolution latest roteia via Baileys internamente).
     let replyTo = jid;
     if (jid.includes('@lid')) {
-      replyTo = key.senderPn || key.remoteJidAlt || null;
-      if (!replyTo) {
-        console.log('Remetente @lid sem numero real (limitacao Evolution 2.2.3):', jid, '-', body.data.pushName);
-        return;
-      }
+      replyTo = key.senderPn
+        ? `${key.senderPn}@s.whatsapp.net`
+        : (key.remoteJidAlt || jid);
+      console.log('[lid] replyTo:', replyTo, '| pushName:', body.data.pushName);
     }
 
     // chave estavel para Redis (historico/rate-limit/lead): usa o identificador recebido
